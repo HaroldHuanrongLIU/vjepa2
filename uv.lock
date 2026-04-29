@@ -2513,7 +2513,7 @@ dependencies = [
 ]
 
 [package.dev-dependencies]
-dev = [
+surgwmbench = [
     { name = "black" },
     { name = "flake8" },
     { name = "isort" },
@@ -2550,7 +2550,7 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-dev = [
+surgwmbench = [
     { name = "black", specifier = "==26.3.1" },
     { name = "flake8", specifier = "==7.0.0" },
     { name = "isort", specifier = "==5.13.2" },
