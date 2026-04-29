@@ -76,6 +76,23 @@ def test_interpolation_method_switching_loads_selected_file(tmp_path):
     assert not torch.allclose(linear["selected_coords_px"][non_anchor], pchip["selected_coords_px"][non_anchor])
 
 
+def test_private_use_path_alias_resolves_star_directories(tmp_path):
+    root = make_surgwmbench_root(tmp_path, private_use_path_alias=True)
+    dataset = SurgWMBenchClipDataset(
+        dataset_root=root,
+        manifest="manifests/train.jsonl",
+        image_size=32,
+        frame_sampling="dense",
+        interpolation_method="linear",
+    )
+
+    sample = dataset[0]
+
+    assert sample["trajectory_id"].endswith("\uf021")
+    assert sample["frames"].shape == (25, 3, 32, 32)
+    assert sample["selected_coords_norm"].shape == (25, 2)
+
+
 def test_strict_loader_rejects_missing_interpolation_file(tmp_path):
     root = make_surgwmbench_root(tmp_path, missing_interpolation_method="pchip")
     dataset = SurgWMBenchClipDataset(

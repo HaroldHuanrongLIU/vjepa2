@@ -39,10 +39,13 @@ def _frame_path(dataset_root: Path, frames_dir: Path, frame: Any, fallback_idx: 
     candidate = Path(value)
     if candidate.is_absolute():
         return candidate
-    root_path = dataset_root / candidate
+    root_path = resolve_dataset_path(dataset_root, candidate)
     if root_path.exists():
         return root_path
-    return frames_dir / value
+    frame_dir_path = resolve_dataset_path(frames_dir, value)
+    if frame_dir_path is None:
+        return frames_dir / value
+    return frame_dir_path
 
 
 def _validate_interpolation(

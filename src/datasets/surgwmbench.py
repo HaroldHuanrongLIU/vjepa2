@@ -22,6 +22,7 @@ DATASET_VERSION = "SurgWMBench"
 INTERPOLATION_METHODS = ("linear", "pchip", "akima", "cubic_spline")
 SOURCE_TO_CODE = {"unlabeled": 0, "human": 1, "interpolated": 2}
 CODE_TO_SOURCE = {value: key for key, value in SOURCE_TO_CODE.items()}
+PATH_ALIAS_REPLACEMENTS = {("\uf021", "*")}
 
 
 def read_jsonl_manifest(path: str | Path) -> list[dict[str, Any]]:
@@ -56,7 +57,21 @@ def resolve_dataset_path(dataset_root: str | Path, value: str | Path | None) -> 
     if value is None:
         return None
     path = Path(value).expanduser()
-    return path if path.is_absolute() else Path(dataset_root).expanduser() / path
+    resolved = path if path.is_absolute() else Path(dataset_root).expanduser() / path
+    return _resolve_existing_path_alias(resolved)
+
+
+def _resolve_existing_path_alias(path: Path) -> Path:
+    if path.exists():
+        return path
+    path_text = str(path)
+    for old, new in PATH_ALIAS_REPLACEMENTS:
+        if old not in path_text:
+            continue
+        alias = Path(path_text.replace(old, new))
+        if alias.exists():
+            return alias
+    return path
 
 
 def load_json(path: str | Path) -> Any:
@@ -500,9 +515,9 @@ class SurgWMBenchClipDataset(Dataset):
                 path = frames_dir / f"{local_idx:06d}.jpg"
             else:
                 candidate = Path(path_value)
-                path = candidate if candidate.is_absolute() else self.dataset_root / candidate
+                path = candidate if candidate.is_absolute() else resolve_dataset_path(self.dataset_root, candidate)
                 if not path.exists() and not candidate.is_absolute():
-                    path = frames_dir / path_value
+                    path = _resolve_existing_path_alias(frames_dir / path_value)
             by_index[local_idx] = path
 
         paths: list[Path] = []

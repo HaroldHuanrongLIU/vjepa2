@@ -38,6 +38,7 @@ def make_surgwmbench_root(
     *,
     bad_version: bool = False,
     missing_interpolation_method: str | None = None,
+    private_use_path_alias: bool = False,
 ) -> Path:
     root = tmp_path / "SurgWMBench"
     (root / "videos" / "video_01").mkdir(parents=True, exist_ok=True)
@@ -61,15 +62,20 @@ def make_surgwmbench_root(
         start=1,
     ):
         version = "SurgWMBench-v0" if bad_version else "SurgWMBench"
-        frames_dir_rel = f"clips/{patient_id}/{trajectory_id}/frames"
-        annotation_rel = f"clips/{patient_id}/{trajectory_id}/annotation.json"
+        stored_trajectory_id = f"{trajectory_id}\uf021" if private_use_path_alias and clip_idx == 1 else trajectory_id
+        disk_trajectory_id = f"{trajectory_id}*" if private_use_path_alias and clip_idx == 1 else trajectory_id
+        frames_dir_rel = f"clips/{patient_id}/{stored_trajectory_id}/frames"
+        disk_frames_dir_rel = f"clips/{patient_id}/{disk_trajectory_id}/frames"
+        annotation_rel = f"clips/{patient_id}/{stored_trajectory_id}/annotation.json"
+        disk_annotation_rel = f"clips/{patient_id}/{disk_trajectory_id}/annotation.json"
         sampled_indices = _anchor_indices(num_frames)
         sampled_set = set(sampled_indices)
 
         frames = []
         for local_idx in range(num_frames):
             frame_rel = f"{frames_dir_rel}/{local_idx:06d}.jpg"
-            _write_image(root / frame_rel, value=(clip_idx * 20 + local_idx) % 255)
+            disk_frame_rel = f"{disk_frames_dir_rel}/{local_idx:06d}.jpg"
+            _write_image(root / disk_frame_rel, value=(clip_idx * 20 + local_idx) % 255)
             frames.append(
                 {
                     "local_frame_idx": local_idx,
@@ -93,7 +99,12 @@ def make_surgwmbench_root(
             )
 
         interpolation_files = {
-            method: f"interpolations/{patient_id}/{trajectory_id}.{method}.json" for method in INTERPOLATION_METHODS
+            method: f"interpolations/{patient_id}/{stored_trajectory_id}.{method}.json"
+            for method in INTERPOLATION_METHODS
+        }
+        disk_interpolation_files = {
+            method: f"interpolations/{patient_id}/{disk_trajectory_id}.{method}.json"
+            for method in INTERPOLATION_METHODS
         }
         for method_idx, method in enumerate(INTERPOLATION_METHODS):
             coords = []
@@ -112,10 +123,10 @@ def make_surgwmbench_root(
                         "is_out_of_bounds": False,
                     }
                 )
-            _write_json(root / interpolation_files[method], {"coordinates": coords})
+            _write_json(root / disk_interpolation_files[method], {"coordinates": coords})
 
         if missing_interpolation_method is not None:
-            missing = root / interpolation_files[missing_interpolation_method]
+            missing = root / disk_interpolation_files[missing_interpolation_method]
             if missing.exists():
                 missing.unlink()
 
@@ -124,7 +135,7 @@ def make_surgwmbench_root(
             "patient_id": patient_id,
             "source_video_id": "video_01",
             "source_video_path": "videos/video_01/video_left.avi",
-            "trajectory_id": trajectory_id,
+            "trajectory_id": stored_trajectory_id,
             "difficulty": difficulty,
             "num_frames": num_frames,
             "frames": frames,
@@ -134,7 +145,7 @@ def make_surgwmbench_root(
             "default_interpolation_method": "linear",
             "image_size": {"width": 64, "height": 48},
         }
-        _write_json(root / annotation_rel, annotation)
+        _write_json(root / disk_annotation_rel, annotation)
 
         entries.append(
             {
@@ -142,7 +153,7 @@ def make_surgwmbench_root(
                 "patient_id": patient_id,
                 "source_video_id": "video_01",
                 "source_video_path": "videos/video_01/video_left.avi",
-                "trajectory_id": trajectory_id,
+                "trajectory_id": stored_trajectory_id,
                 "difficulty": difficulty,
                 "num_frames": num_frames,
                 "annotation_path": annotation_rel,
