@@ -1,3 +1,48 @@
+[project]
+name = "vjepa2"
+version = "0.0.2"
+description = "PyTorch code and models for V-JEPA 2."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "torch>=2",
+    "torchvision",
+    "tensorboard",
+    "wandb",
+    "iopath",
+    "pyyaml",
+    "numpy",
+    "opencv-python",
+    "submitit",
+    "braceexpand",
+    "webdataset",
+    "timm",
+    "transformers",
+    "peft",
+    "decord",
+    "pandas",
+    "einops",
+    "beartype",
+    "psutil",
+    "h5py",
+    "fire",
+    "python-box",
+    "scikit-image",
+    "ftfy",
+    "jupyter",
+]
+
+[dependency-groups]
+dev = [
+    "black==26.3.1",
+    "flake8==7.0.0",
+    "isort==5.13.2",
+    "pytest==9.0.3",
+]
+
+[tool.uv]
+package = false
+
 [tool.isort]
 profile="black"
 line_length=119
