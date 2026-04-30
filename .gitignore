@@ -21,6 +21,8 @@ run_pretrain.py
 *.ipynb_checkpoints/
 
 traces/
+checkpoints/
+results/
 third_party/*
 
 evals/simu_env_planning/local/

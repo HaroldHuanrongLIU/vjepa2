@@ -121,3 +121,19 @@ def collate_dense_variable_length(batch: list[dict[str, Any]]) -> dict[str, Any]
     }
     result.update(_metadata(batch))
     return result
+
+
+def collate_ssl_video(batch: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collate fixed-length unlabeled video clips for SSL pretraining."""
+
+    if not batch:
+        raise ValueError("Cannot collate an empty batch.")
+
+    return {
+        "frames": torch.stack([item["frames"] for item in batch], dim=0),
+        "source_video_id": [item["source_video_id"] for item in batch],
+        "source_video_path": [item["source_video_path"] for item in batch],
+        "start_frame": torch.as_tensor([int(item["start_frame"]) for item in batch], dtype=torch.long),
+        "frame_indices": torch.stack([item["frame_indices"] for item in batch], dim=0),
+        "backend": [item["backend"] for item in batch],
+    }
