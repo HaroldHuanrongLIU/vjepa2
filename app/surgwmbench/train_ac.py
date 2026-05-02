@@ -3,18 +3,42 @@
 from __future__ import annotations
 
 import argparse
+import os
 import random
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
+import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 
 from src.datasets.surgwmbench import SurgWMBenchClipDataset
 from src.datasets.surgwmbench_collators import collate_sparse_anchors
 from src.models.surgwmbench_vjepa_ac import SurgVJEPA2AC, load_surgwmbench_encoder
+
+
+def _setup_distributed() -> tuple[int, int, int, bool]:
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1:
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl", init_method="env://")
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        torch.cuda.set_device(local_rank)
+        return world_size, rank, local_rank, True
+    return 1, 0, 0, False
+
+
+def _unwrap(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, DistributedDataParallel) else model
+
+
+def _is_main_process() -> bool:
+    return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
 
 
 def set_seed(seed: int) -> None:
@@ -103,7 +127,7 @@ def _run_epoch(
     training = optimizer is not None
     model.train(training)
     if args.freeze_encoder:
-        model.encoder.eval()
+        _unwrap(model).encoder.eval()
     totals: dict[str, float] = {}
     count = 0
     use_amp = bool(args.precision == "amp" and device.type == "cuda")
@@ -140,7 +164,12 @@ def _run_epoch(
 
 def train_ac(args: argparse.Namespace) -> Path:
     set_seed(args.seed)
-    device = _device(args.device)
+    world_size, rank, local_rank, distributed = _setup_distributed()
+    if distributed:
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = _device(args.device)
+
     train_dataset = SurgWMBenchClipDataset(
         dataset_root=args.dataset_root,
         manifest=args.train_manifest,
@@ -149,15 +178,26 @@ def train_ac(args: argparse.Namespace) -> Path:
         frame_sampling="sparse_anchors",
     )
     train_dataset = _maybe_subset(train_dataset, args.max_train_samples)
+    train_sampler: DistributedSampler | None = None
+    train_shuffle = True
+    if distributed:
+        train_sampler = DistributedSampler(
+            train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False
+        )
+        train_shuffle = False
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=train_shuffle,
+        sampler=train_sampler,
         num_workers=args.num_workers,
         collate_fn=collate_sparse_anchors,
+        pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
     )
 
     val_loader = None
+    val_sampler: DistributedSampler | None = None
     if args.val_manifest:
         val_dataset = SurgWMBenchClipDataset(
             dataset_root=args.dataset_root,
@@ -167,15 +207,28 @@ def train_ac(args: argparse.Namespace) -> Path:
             frame_sampling="sparse_anchors",
         )
         val_dataset = _maybe_subset(val_dataset, args.max_val_samples)
+        if distributed:
+            val_sampler = DistributedSampler(
+                val_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False
+            )
         val_loader = DataLoader(
             val_dataset,
             batch_size=args.batch_size,
             shuffle=False,
+            sampler=val_sampler,
             num_workers=args.num_workers,
             collate_fn=collate_sparse_anchors,
+            pin_memory=device.type == "cuda",
+            persistent_workers=args.num_workers > 0,
         )
 
     model = build_model(args, device)
+    if distributed:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            find_unused_parameters=args.freeze_encoder,
+        )
     optimizer = torch.optim.AdamW(
         (param for param in model.parameters() if param.requires_grad), lr=args.lr, weight_decay=args.weight_decay
     )
@@ -184,6 +237,8 @@ def train_ac(args: argparse.Namespace) -> Path:
     history: list[dict[str, float]] = []
     best_val_loss: float | None = None
     for epoch in range(args.epochs):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         train_stats = _run_epoch(model, train_loader, device, args, optimizer=optimizer, scaler=scaler)
         stats = {f"train_{key}": value for key, value in train_stats.items()}
         if val_loader is not None:
@@ -191,26 +246,34 @@ def train_ac(args: argparse.Namespace) -> Path:
                 val_stats = _run_epoch(model, val_loader, device, args)
             stats.update({f"val_{key}": value for key, value in val_stats.items()})
             best_val_loss = stats["val_loss"] if best_val_loss is None else min(best_val_loss, stats["val_loss"])
+        if _is_main_process():
+            print(f"[epoch {epoch}] {stats}", flush=True)
         history.append(stats)
 
     output = Path(args.output).expanduser()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model_state": model.state_dict(),
-            "model_config": {
-                "encoder_name": args.encoder_name,
-                "latent_dim": args.latent_dim,
-                "hidden_dim": args.hidden_dim,
-                "image_size": args.image_size,
-                "freeze_encoder": args.freeze_encoder,
+    if _is_main_process():
+        output.parent.mkdir(parents=True, exist_ok=True)
+        base = _unwrap(model)
+        torch.save(
+            {
+                "model_state": base.state_dict(),
+                "model_config": {
+                    "encoder_name": args.encoder_name,
+                    "latent_dim": args.latent_dim,
+                    "hidden_dim": args.hidden_dim,
+                    "image_size": args.image_size,
+                    "freeze_encoder": args.freeze_encoder,
+                },
+                "train_args": vars(args),
+                "history": history,
+                "best_val_loss": best_val_loss,
+                "world_size": world_size,
             },
-            "train_args": vars(args),
-            "history": history,
-            "best_val_loss": best_val_loss,
-        },
-        output,
-    )
+            output,
+        )
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()
     return output
 
 

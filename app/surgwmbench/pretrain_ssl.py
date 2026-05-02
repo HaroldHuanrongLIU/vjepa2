@@ -3,19 +3,45 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import os
 import random
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 
 from src.datasets.surgwmbench_collators import collate_ssl_video
 from src.datasets.surgwmbench_video import SurgWMBenchRawVideoDataset
 from src.models.surgwmbench_vjepa_ac import load_surgwmbench_encoder
+
+
+def _setup_distributed() -> tuple[int, int, int, bool]:
+    """Initialize torch.distributed when launched via torchrun; otherwise no-op."""
+
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1:
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl", init_method="env://")
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        torch.cuda.set_device(local_rank)
+        return world_size, rank, local_rank, True
+    return 1, 0, 0, False
+
+
+def _unwrap(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, DistributedDataParallel) else model
+
+
+def _is_main_process() -> bool:
+    return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
 
 
 def set_seed(seed: int) -> None:
@@ -46,7 +72,13 @@ def _maybe_subset(dataset: SurgWMBenchRawVideoDataset, max_samples: int | None) 
 
 
 class SurgWMBenchSSLModel(nn.Module):
-    """Temporal latent next-step SSL objective for SurgWMBench smoke pretraining."""
+    """V-JEPA-flavored SSL: EMA target encoder + temporal frame masking on the online branch.
+
+    The online encoder sees a randomly frame-masked clip and predicts each next-step latent
+    from the prior context. The target encoder is an EMA copy of the online encoder, sees the
+    full unmasked clip, and produces stop-gradient targets. EMA + masking together break the
+    trivial constant-latent collapse of pure self-distillation.
+    """
 
     def __init__(
         self,
@@ -55,10 +87,14 @@ class SurgWMBenchSSLModel(nn.Module):
         latent_dim: int,
         hidden_dim: int,
         freeze_encoder: bool = False,
+        ema_decay: float = 0.996,
+        mask_ratio: float = 0.25,
     ) -> None:
         super().__init__()
         self.encoder = encoder
         self.latent_dim = latent_dim
+        self.ema_decay = float(ema_decay)
+        self.mask_ratio = float(mask_ratio)
         encoder_dim = int(getattr(encoder, "embed_dim", latent_dim))
         self.latent_proj = nn.Identity() if encoder_dim == latent_dim else nn.Linear(encoder_dim, latent_dim)
         self.predictor = nn.GRU(input_size=latent_dim, hidden_size=latent_dim, batch_first=True)
@@ -67,19 +103,29 @@ class SurgWMBenchSSLModel(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, latent_dim),
         )
+
+        self.target_encoder = copy.deepcopy(encoder)
+        self.target_latent_proj = copy.deepcopy(self.latent_proj)
+        for param in self.target_encoder.parameters():
+            param.requires_grad = False
+        for param in self.target_latent_proj.parameters():
+            param.requires_grad = False
+        self.target_encoder.eval()
+        self.target_latent_proj.eval()
+
         if freeze_encoder:
             for param in self.encoder.parameters():
                 param.requires_grad = False
             self.encoder.eval()
 
-    def encode_frames(self, frames: torch.Tensor) -> torch.Tensor:
-        if hasattr(self.encoder, "encode_frames"):
-            latents = self.encoder.encode_frames(frames)
-            return self.latent_proj(latents)
+    @staticmethod
+    def _encode_with(encoder: nn.Module, proj: nn.Module, frames: torch.Tensor) -> torch.Tensor:
+        if hasattr(encoder, "encode_frames"):
+            return proj(encoder.encode_frames(frames))
         if frames.ndim != 5:
             raise ValueError(f"frames must have shape [B, T, 3, H, W], got {tuple(frames.shape)}")
         batch_size, timesteps = frames.shape[:2]
-        tokens = self.encoder(frames.flatten(0, 1))
+        tokens = encoder(frames.flatten(0, 1))
         if isinstance(tokens, (list, tuple)):
             tokens = tokens[-1]
         if tokens.ndim == 3:
@@ -88,17 +134,43 @@ class SurgWMBenchSSLModel(nn.Module):
             pooled = tokens
         else:
             raise ValueError(f"Unsupported encoder output shape: {tuple(tokens.shape)}")
-        return self.latent_proj(pooled.view(batch_size, timesteps, -1))
+        return proj(pooled.view(batch_size, timesteps, -1))
+
+    def encode_frames(self, frames: torch.Tensor) -> torch.Tensor:
+        return self._encode_with(self.encoder, self.latent_proj, frames)
+
+    def _mask_frames(self, frames: torch.Tensor) -> torch.Tensor:
+        if self.mask_ratio <= 0.0 or not self.training:
+            return frames
+        batch_size, timesteps = frames.shape[:2]
+        keep = torch.rand(batch_size, timesteps, device=frames.device) >= self.mask_ratio
+        # Guarantee at least the first frame stays so the predictor has a real context start.
+        keep[:, 0] = True
+        mask = keep.view(batch_size, timesteps, 1, 1, 1).to(frames.dtype)
+        return frames * mask
 
     def forward(self, frames: torch.Tensor) -> dict[str, torch.Tensor]:
-        latents = self.encode_frames(frames)
-        pred_sequence, _ = self.predictor(latents[:, :-1])
+        masked = self._mask_frames(frames)
+        online_latents = self._encode_with(self.encoder, self.latent_proj, masked)
+        with torch.no_grad():
+            target_latents = self._encode_with(self.target_encoder, self.target_latent_proj, frames)
+        pred_sequence, _ = self.predictor(online_latents[:, :-1])
         pred_latents = self.prediction_head(pred_sequence)
         return {
-            "latents": latents,
-            "pred_latents": pred_latents,
-            "target_latents": latents[:, 1:].detach(),
+            "latents": online_latents,
+            "pred_latents": F.normalize(pred_latents, dim=-1),
+            "target_latents": F.normalize(target_latents[:, 1:].detach(), dim=-1),
         }
+
+    @torch.no_grad()
+    def update_target_ema(self) -> None:
+        decay = self.ema_decay
+        for online_p, target_p in zip(self.encoder.parameters(), self.target_encoder.parameters()):
+            target_p.data.mul_(decay).add_(online_p.data, alpha=1.0 - decay)
+        for online_b, target_b in zip(self.encoder.buffers(), self.target_encoder.buffers()):
+            target_b.data.copy_(online_b.data)
+        for online_p, target_p in zip(self.latent_proj.parameters(), self.target_latent_proj.parameters()):
+            target_p.data.mul_(decay).add_(online_p.data, alpha=1.0 - decay)
 
 
 def build_model(args: argparse.Namespace, device: torch.device) -> SurgWMBenchSSLModel:
@@ -116,6 +188,8 @@ def build_model(args: argparse.Namespace, device: torch.device) -> SurgWMBenchSS
         latent_dim=args.latent_dim,
         hidden_dim=args.hidden_dim,
         freeze_encoder=args.freeze_encoder,
+        ema_decay=getattr(args, "ema_decay", 0.996),
+        mask_ratio=getattr(args, "mask_ratio", 0.25),
     ).to(device)
 
 
@@ -130,7 +204,7 @@ def _run_epoch(
     training = optimizer is not None
     model.train(training)
     if args.freeze_encoder:
-        model.encoder.eval()
+        _unwrap(model).encoder.eval()
     use_amp = bool(args.precision == "amp" and device.type == "cuda")
     total_loss = 0.0
     count = 0
@@ -157,6 +231,7 @@ def _run_epoch(
                     if args.grad_clip_norm > 0:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
                     optimizer.step()
+                _unwrap(model).update_target_ema()
         batch_size = int(batch["frames"].shape[0])
         total_loss += float(loss.detach().cpu()) * batch_size
         count += batch_size
@@ -165,7 +240,12 @@ def _run_epoch(
 
 def pretrain_ssl(args: argparse.Namespace) -> Path:
     set_seed(args.seed)
-    device = _device(args.device)
+    world_size, rank, local_rank, distributed = _setup_distributed()
+    if distributed:
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = _device(args.device)
+
     backend = "opencv_or_frames" if args.ssl_source == "raw_videos" else "frames"
     dataset = SurgWMBenchRawVideoDataset(
         dataset_root=args.dataset_root,
@@ -180,41 +260,64 @@ def pretrain_ssl(args: argparse.Namespace) -> Path:
         max_clips_per_video=args.max_clips_per_video,
     )
     dataset = _maybe_subset(dataset, args.max_samples)
+    sampler: DistributedSampler | None = None
+    shuffle = True
+    if distributed:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False)
+        shuffle = False
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=shuffle,
+        sampler=sampler,
         num_workers=args.num_workers,
         collate_fn=collate_ssl_video,
+        pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
     )
     model = build_model(args, device)
+    if distributed:
+        model = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=False)
     optimizer = torch.optim.AdamW(
         (param for param in model.parameters() if param.requires_grad), lr=args.lr, weight_decay=args.weight_decay
     )
     scaler = torch.amp.GradScaler(device=device.type, enabled=bool(args.precision == "amp" and device.type == "cuda"))
 
     history: list[dict[str, float]] = []
-    for _epoch in range(args.epochs):
-        history.append(_run_epoch(model, loader, device, args, optimizer=optimizer, scaler=scaler))
+    for epoch in range(args.epochs):
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+        stats = _run_epoch(model, loader, device, args, optimizer=optimizer, scaler=scaler)
+        if _is_main_process():
+            print(f"[epoch {epoch}] {stats}", flush=True)
+        history.append(stats)
 
     output = Path(args.output).expanduser()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "encoder": model.encoder.state_dict(),
-            "model_state": model.state_dict(),
-            "model_config": {
-                "encoder_name": args.encoder_name,
-                "latent_dim": args.latent_dim,
-                "hidden_dim": args.hidden_dim,
-                "image_size": args.image_size,
-                "freeze_encoder": args.freeze_encoder,
+    if _is_main_process():
+        output.parent.mkdir(parents=True, exist_ok=True)
+        base = _unwrap(model)
+        torch.save(
+            {
+                "encoder": base.encoder.state_dict(),
+                "model_state": base.state_dict(),
+                "model_config": {
+                    "encoder_name": args.encoder_name,
+                    "latent_dim": args.latent_dim,
+                    "hidden_dim": args.hidden_dim,
+                    "image_size": args.image_size,
+                    "freeze_encoder": args.freeze_encoder,
+                    "ema_decay": getattr(args, "ema_decay", 0.996),
+                    "mask_ratio": getattr(args, "mask_ratio", 0.25),
+                },
+                "train_args": vars(args),
+                "history": history,
+                "world_size": world_size,
             },
-            "train_args": vars(args),
-            "history": history,
-        },
-        output,
-    )
+            output,
+        )
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()
     return output
 
 
@@ -247,12 +350,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-videos", type=int, default=None)
     parser.add_argument("--max-clips-per-video", type=int, default=None)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--ema-decay", type=float, default=0.996)
+    parser.add_argument("--mask-ratio", type=float, default=0.25)
     return parser
 
 
 def main() -> None:
     output = pretrain_ssl(build_parser().parse_args())
-    print(f"Saved SSL checkpoint to {output}")
+    if _is_main_process():
+        print(f"Saved SSL checkpoint to {output}")
 
 
 if __name__ == "__main__":
